@@ -155,7 +155,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # Node 依赖在多架构下需要在目标架构里执行 npm ci，必须用 QEMU
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
