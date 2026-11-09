@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -114,10 +114,12 @@ jobs:
               img_ok=1
             fi
 
-            # 两个架构 × (镜像归档 + sha256) = 4 个文件
-            n=$(gh release view "ddns-${version}" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets | length' 2>/dev/null || echo 0)
-            if [ "${n:-0}" -ge 4 ]; then
+            # 两个架构的 tar.gz 都必须在 1MB 以上；只看数量会把空包当成完整
+            good=$(gh release view "ddns-${version}" --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '[.assets[] | select(.name | endswith(".tar.gz")) | select(.size > 1000000)] | length' \
+              2>/dev/null || echo 0)
+            if [ "${good:-0}" -ge 2 ]; then
               rel_ok=1
             fi
 
@@ -155,7 +157,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # Node 依赖在多架构下需要在目标架构里执行 npm ci，必须用 QEMU
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
@@ -213,16 +215,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: 拉取并归档
+      - name: 安装 skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+
+      - name: 导出指定架构的镜像归档
         env:
           VERSION: ${{ needs.check.outputs.version }}
           IMAGE: ${{ needs.check.outputs.image }}
         run: |
-          set -eux
+          set -euo pipefail
           ref="${REGISTRY}/${IMAGE}:ddns-${VERSION}"
           name="aliyun-ddns-image_${VERSION}_linux_${{ matrix.arch }}"
-          docker pull --platform "linux/${{ matrix.arch }}" "$ref"
-          docker save "$ref" | gzip -9 > "${name}.tar.gz"
+
+          # 按架构直接从 registry 导出，不依赖 docker save 对多架构 tag 的处理
+          skopeo copy --retry-times 3 \
+            --override-os linux --override-arch "${{ matrix.arch }}" \
+            "docker://${ref}" "docker-archive:${name}.tar:${ref}"
+
+          # 空包/半包直接失败，不进入上传
+          test -s "${name}.tar"
+          size=$(stat -c%s "${name}.tar")
+          echo "tar size: ${size} bytes"
+          test "${size}" -gt 10000000
+
+          gzip -9 "${name}.tar"
+          test -s "${name}.tar.gz"
           sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           ls -lh "${name}.tar.gz"
 
