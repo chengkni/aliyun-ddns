@@ -1,0 +1,24 @@
+version: 2
+
+updates:
+  # npm 依赖：官方 SDK 及其传递依赖
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      aliyun-sdk:
+        patterns:
+          - "@alicloud/*"
+          - "@darabonba/*"
+
+  # GitHub Actions 版本
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+# 注意：Dockerfile 里用的是浮动 tag node:22-alpine，Dependabot 的 docker
+# ecosystem 不会跟随这类 tag。基础镜像的补丁由 build.yml 的每日指纹探测
+# （BASE_IMAGE 的 digest）负责触发重建。

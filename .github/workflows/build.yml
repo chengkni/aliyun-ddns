@@ -1,0 +1,292 @@
+name: Build aliyun-ddns
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # 每天探测一次基础镜像；只有「构建指纹」变了才真正构建（见 check job）。
+    # npm 依赖不在这里自动升级，走 Dependabot PR + 测试。
+    - cron: "27 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: node:22-alpine
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ============================================================ 测试
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 语法检查
+        run: node --check src/index.js && node --check src/lib.js
+
+  # ============================================================ 指纹
+  # 轻量 job：算构建输入、决定要不要真构建。
+  check:
+    name: 计算构建指纹
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      version: ${{ steps.resolve.outputs.version }}
+      fingerprint: ${{ steps.resolve.outputs.fingerprint }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 解析版本与指纹
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # GHCR 镜像名必须全小写
+          image="${GITHUB_REPOSITORY,,}"
+          version=$(node -p "require('./package.json').version")
+
+          lock_hash=$(sha256sum package-lock.json | cut -c1-12)
+          source_hash=$(cat src/index.js src/lib.js | sha256sum | cut -c1-12)
+          dockerfile_hash=$(sha256sum Dockerfile | cut -c1-12)
+          base_digest=$(docker buildx imagetools inspect "${BASE_IMAGE}" \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || echo unknown)
+
+          fp="app=${version};lock=${lock_hash};src=${source_hash};dockerfile=${dockerfile_hash};base=${base_digest}"
+          hash=$(printf '%s' "$fp" | sha256sum | cut -c1-12)
+
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "fingerprint=${hash}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 构建输入"
+            echo ""
+            echo '```'
+            echo "$fp" | tr ';' '\n'
+            echo '```'
+            echo ""
+            echo "- 指纹编号：\`fp-${hash}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 手动触发 / 任何 push：总是构建。
+          # 定时探测和 PR：只有指纹没构建过（或 Release 不完整）才构建。
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "push" ]; then
+            should=true
+            reason="手动触发或 push，总是构建"
+          elif echo "$GH_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin >/dev/null 2>&1; then
+            img_ok=0
+            rel_ok=0
+
+            if docker buildx imagetools inspect "${REGISTRY}/${image}:fp-${hash}" >/dev/null 2>&1; then
+              img_ok=1
+            fi
+
+            # 两个架构 × (镜像归档 + sha256) = 4 个文件
+            n=$(gh release view "ddns-${version}" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" -ge 4 ]; then
+              rel_ok=1
+            fi
+
+            if [ "$img_ok" = 1 ] && [ "$rel_ok" = 1 ]; then
+              should=false
+              reason="指纹 fp-${hash} 已构建且 Release 完整，跳过"
+            elif [ "$img_ok" = 1 ]; then
+              should=true
+              reason="镜像已存在但 Release 不完整，补建"
+            else
+              should=true
+              reason="发现还没构建过的指纹，开始构建"
+            fi
+          else
+            should=true
+            reason="登录 GHCR 查询失败，保守起见选择构建"
+          fi
+
+          echo "build=${should}" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "### 决定：构建 = \`${should}\`"
+            echo ""
+            echo "${reason}（事件：\`${EVENT}\`）"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::${reason}"
+
+  # ============================================================ 镜像
+  image:
+    name: 镜像 linux/amd64 + linux/arm64
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 依赖在多架构下需要在目标架构里执行 npm ci，必须用 QEMU
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.check.outputs.image }}
+          tags: |
+            type=raw,value=ddns-${{ needs.check.outputs.version }}
+            type=raw,value=fp-${{ needs.check.outputs.fingerprint }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha,format=short,prefix=sha-
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NPM_REGISTRY=https://registry.npmjs.org
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ============================================================ 归档
+  # 把镜像 docker save 后附到 Release，方便拉不动 GHCR 时离线分发。
+  # 必须等 image 跑完，所以 image 失败时这里会被跳过。
+  archive:
+    name: 镜像归档 linux/${{ matrix.arch }}
+    needs: [check, image]
+    if: needs.check.outputs.build == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # 串行跑：两个 job 都要确保 Release 存在，并行会撞车
+      max-parallel: 1
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 拉取并归档
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          IMAGE: ${{ needs.check.outputs.image }}
+        run: |
+          set -eux
+          ref="${REGISTRY}/${IMAGE}:ddns-${VERSION}"
+          name="aliyun-ddns-image_${VERSION}_linux_${{ matrix.arch }}"
+          docker pull --platform "linux/${{ matrix.arch }}" "$ref"
+          docker save "$ref" | gzip -9 > "${name}.tar.gz"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          ls -lh "${name}.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aliyun-ddns-linux-${{ matrix.arch }}
+          path: |
+            aliyun-ddns-image_${{ needs.check.outputs.version }}_linux_${{ matrix.arch }}.tar.gz
+            aliyun-ddns-image_${{ needs.check.outputs.version }}_linux_${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: 发布/更新 ddns-<版本> 的 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          FP: ${{ needs.check.outputs.fingerprint }}
+          IMAGE: ${{ needs.check.outputs.image }}
+        run: |
+          set -eux
+          tag="ddns-${VERSION}"
+
+          notes=$(cat <<EOF
+          aliyun-ddns **v${VERSION}**，由 GitHub Actions 自动构建。
+
+          #### Docker 镜像
+
+          ~~~
+          docker pull ghcr.io/${IMAGE}:${tag}
+          ~~~
+
+          支持 \`linux/amd64\` 与 \`linux/arm64\`。同一次构建还会打上
+          \`latest\`（默认分支最新）、\`fp-${FP}\`（构建指纹，不可变）、
+          \`sha-<提交>\`（对应提交）等标签。
+
+          #### 离线镜像归档
+
+          拉不动 ghcr.io、或要分发到没有外网的机器时，下载对应架构的文件：
+
+          - \`aliyun-ddns-image_${VERSION}_linux_amd64.tar.gz\`（另有同名 \`.sha256\`）
+          - \`aliyun-ddns-image_${VERSION}_linux_arm64.tar.gz\`（另有同名 \`.sha256\`）
+
+          ~~~
+          sha256sum -c aliyun-ddns-image_${VERSION}_linux_amd64.tar.gz.sha256
+          docker load < aliyun-ddns-image_${VERSION}_linux_amd64.tar.gz
+          ~~~
+
+          加载出来的镜像名与 GHCR 上完全一致（\`ghcr.io/${IMAGE}:${tag}\`），
+          所以 docker-compose.yml 里的 \`image:\` 不用改。
+
+          #### 构建信息
+
+          - 构建指纹：\`fp-${FP}\`
+          - 构建日志：https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "aliyun-ddns ${VERSION}" --notes "$notes"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "aliyun-ddns ${VERSION}" --notes "$notes"
+          fi
+
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            "aliyun-ddns-image_${VERSION}_linux_${{ matrix.arch }}.tar.gz" \
+            "aliyun-ddns-image_${VERSION}_linux_${{ matrix.arch }}.tar.gz.sha256"

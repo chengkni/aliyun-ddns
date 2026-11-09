@@ -1,0 +1,8 @@
+# 敏感配置
+.env
+.env.*
+
+# 依赖与产物
+node_modules/
+*.tar.gz
+*.log

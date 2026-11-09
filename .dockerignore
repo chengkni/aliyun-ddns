@@ -1,0 +1,10 @@
+# 构建上下文只需要代码和依赖清单
+.git
+.github
+node_modules
+test
+*.md
+.env
+.env.*
+Dockerfile
+.dockerignore

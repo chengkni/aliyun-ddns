@@ -1,0 +1,20 @@
+{
+  "name": "aliyun-ddns",
+  "version": "2.1.0",
+  "private": true,
+  "description": "阿里云 DNS A / AAAA 记录自动更新（官方 v2 SDK）",
+  "main": "src/index.js",
+  "license": "WTFPL",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@alicloud/alidns20150109": "4.6.1",
+    "@alicloud/openapi-core": "1.0.9",
+    "@darabonba/typescript": "1.0.6"
+  }
+}
